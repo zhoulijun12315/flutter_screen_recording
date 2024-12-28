@@ -279,16 +279,9 @@ let screenSize = UIScreen.main.bounds
                         print("Error finishing video: \(error.localizedDescription)")
                     } else {
                         print("Video writing finished")
-                        
-                        // 直接保存到相册
+                        // 移除保存到相册的代码，只打印路径
                         if let url = self.videoOutputURL {
-                            PHPhotoLibrary.shared().performChanges({
-                                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-                            }) { success, error in
-                                if !success {
-                                    print("Error saving video: \(error?.localizedDescription ?? "")")
-                                }
-                            }
+                            print("Video saved to: \(url.path)")
                         }
                     }
                     group.leave()
