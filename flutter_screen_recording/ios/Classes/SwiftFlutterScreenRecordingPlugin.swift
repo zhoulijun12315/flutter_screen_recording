@@ -45,13 +45,17 @@ let screenSize = UIScreen.main.bounds
 
 
     @objc func startRecording() {
+        print("Starting recording...")
+        
+        // 确保之前的录制已经完全停止
+        if videoWriter != nil {
+            stopRecording()
+        }
 
-        //Use ReplayKit to record the screen
-        //Create the file path to write to
         let documentsPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] as NSString
         self.videoOutputURL = URL(fileURLWithPath: documentsPath.appendingPathComponent(nameVideo))
+        print("Video will be saved to: \(self.videoOutputURL?.path ?? "")")
 
-        //Check the file does not already exist by deleting it if it does
         do {
             try FileManager.default.removeItem(at: videoOutputURL!)
         } catch {}
@@ -59,138 +63,241 @@ let screenSize = UIScreen.main.bounds
         do {
             try videoWriter = AVAssetWriter(outputURL: videoOutputURL!, fileType: AVFileType.mp4)
         } catch let writerError as NSError {
-            print("Error opening video file", writerError);
-            videoWriter = nil;
-            return;
+            print("Error creating writer: \(writerError)")
+            myResult?(false)
+            return
         }
 
-        //Create the video settings
         if #available(iOS 11.0, *) {
+            let codec = AVVideoCodecH264
             
-            var codec = AVVideoCodecJPEG;
+            // 获取当前设备方向
+            let orientation = UIDevice.current.orientation
+            let isLandscape = orientation.isLandscape
             
-            if(recordAudio){
-                codec = AVVideoCodecH264;
-            }
+            // 获取屏幕的实际分辨率
+            let nativeWidth = UIScreen.main.nativeBounds.width
+            let nativeHeight = UIScreen.main.nativeBounds.height
+            
+            // 根据方向设置正确的宽高
+            let videoWidth = isLandscape ? max(nativeWidth, nativeHeight) : min(nativeWidth, nativeHeight)
+            let videoHeight = isLandscape ? min(nativeWidth, nativeHeight) : max(nativeWidth, nativeHeight)
+            
+            print("Screen native bounds: \(UIScreen.main.nativeBounds)")
+            print("Recording with orientation: \(orientation.rawValue), dimensions: \(videoWidth)x\(videoHeight)")
+            
+            // 视频压缩设置
+            let compressionProperties: [String: Any] = [
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoAverageBitRateKey: 80_000_000,
+                AVVideoMaxKeyFrameIntervalKey: 10,
+                AVVideoExpectedSourceFrameRateKey: 60,
+                AVVideoQualityKey: 1.0,
+                AVVideoAllowFrameReorderingKey: false
+            ]
             
             let videoSettings: [String : Any] = [
-                AVVideoCodecKey  : codec,
-                AVVideoWidthKey  : screenSize.width,
-                AVVideoHeightKey : screenSize.height
+                AVVideoCodecKey: codec,
+                AVVideoWidthKey: videoWidth,
+                AVVideoHeightKey: videoHeight,
+                AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,  // 改用 Aspect 而不是 AspectFill
+                AVVideoCompressionPropertiesKey: compressionProperties
             ]
-                        
-            if(recordAudio){
+
+            // 创建视频写入器
+            videoWriterInput = AVAssetWriterInput(mediaType: AVMediaType.video, outputSettings: videoSettings)
+            videoWriterInput?.expectsMediaDataInRealTime = true
+            
+            // 根据方向设置变换
+            if isLandscape {
+                var transform = CGAffineTransform.identity
                 
-                let audioOutputSettings: [String : Any] = [
-                    AVNumberOfChannelsKey : 2,
-                    AVFormatIDKey : kAudioFormatMPEG4AAC,
-                    AVSampleRateKey: 44100,
+                // 设置旋转
+                let rotationAngle = orientation == .landscapeLeft ? 
+                    -CGFloat.pi*2 :     // landscapeLeft: -360度
+                    CGFloat.pi*2        // landscapeRight: 向右旋转360度
+                transform = transform.rotated(by: rotationAngle)
+                
+                // 设置平移以确保内容居中
+                if orientation == .landscapeLeft {
+                    transform = transform.translatedBy(x: 0, y: -videoHeight)
+                } else {
+                    transform = transform.translatedBy(x: 0, y: videoHeight)
+                }
+                
+                videoWriterInput?.transform = transform
+                
+                // 添加方向元数据
+                if let writer = videoWriter {
+                    let orientationMetadata = AVMutableMetadataItem()
+                    orientationMetadata.keySpace = AVMetadataKeySpace.common
+                    orientationMetadata.key = "orientation" as NSString
+                    orientationMetadata.value = orientation == .landscapeLeft ? "0" as NSString : "180" as NSString
+                    writer.metadata = [orientationMetadata]
+                }
+            }
+            
+            // 设置视频写入器的其他属性
+            if let writer = videoWriter {
+                writer.movieTimeScale = CMTimeScale(600)
+                writer.shouldOptimizeForNetworkUse = true
+                
+                // 添加视频方向标记
+                let orientationMetadata = AVMutableMetadataItem()
+                orientationMetadata.keySpace = AVMetadataKeySpace.common
+                orientationMetadata.key = "orientation" as NSString
+                orientationMetadata.value = isLandscape ? "90" as NSString : "0" as NSString
+                writer.metadata = [orientationMetadata]
+            }
+            
+            // 添加像素缓冲适配器，使用更高质量的设置
+            let attributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64ARGB,
+                kCVPixelBufferWidthKey as String: videoWidth,
+                kCVPixelBufferHeightKey as String: videoHeight,
+                kCVPixelBufferCGImageCompatibilityKey as String: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+            
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoWriterInput!,
+                sourcePixelBufferAttributes: attributes
+            )
+            
+            if let input = videoWriterInput {
+                videoWriter?.add(input)
+            }
+
+            // 音频设置
+            if(recordAudio){
+                let audioSettings: [String : Any] = [
+                    AVNumberOfChannelsKey: 2,
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: 48000,                // 提高采样率
+                    AVEncoderBitRateKey: 192000,          // 192kbps 音频比特率
+                    AVEncoderAudioQualityKey: AVAudioQuality.max.rawValue
                 ]
                 
-                audioInput = AVAssetWriterInput(mediaType: AVMediaType.audio, outputSettings: audioOutputSettings)
+                audioInput = AVAssetWriterInput(mediaType: AVMediaType.audio, outputSettings: audioSettings)
+                audioInput.expectsMediaDataInRealTime = true
                 videoWriter?.add(audioInput)
-            
             }
 
+            RPScreenRecorder.shared().isMicrophoneEnabled = recordAudio
 
-        //Create the asset writer input object whihc is actually used to write out the video
-         videoWriterInput = AVAssetWriterInput(mediaType: AVMediaType.video, outputSettings: videoSettings);
-         videoWriter?.add(videoWriterInput!);
-            
-        }
+            var isWritingStarted = false
+            let writingQueue = DispatchQueue(label: "com.recording.writing")
 
-        //Tell the screen recorder to start capturing and to call the handler
-        if #available(iOS 11.0, *) {
-            
-            if(recordAudio){
-                RPScreenRecorder.shared().isMicrophoneEnabled=true;
-            }else{
-                RPScreenRecorder.shared().isMicrophoneEnabled=false;
-
-            }
-            
-            RPScreenRecorder.shared().startCapture(
-            handler: { (cmSampleBuffer, rpSampleType, error) in
-                guard error == nil else {
-                    //Handle error
-                    print("Error starting capture");
-                    self.myResult!(false)
-                    return;
+            RPScreenRecorder.shared().startCapture(handler: { [weak self] (cmSampleBuffer, rpSampleType, error) in
+                guard let self = self else { return }
+                
+                if let error = error {
+                    print("Capture error: \(error.localizedDescription)")
+                    return
                 }
 
-                switch rpSampleType {
-                case RPSampleBufferType.video:
-                    print("writing sample....");
-                    if self.videoWriter?.status == AVAssetWriter.Status.unknown {
-
-                        if (( self.videoWriter?.startWriting ) != nil) {
-                            print("Starting writing");
-                            self.myResult!(true)
-                            self.videoWriter?.startWriting()
-                            self.videoWriter?.startSession(atSourceTime:  CMSampleBufferGetPresentationTimeStamp(cmSampleBuffer))
-                        }
-                    }
-
-                    if self.videoWriter?.status == AVAssetWriter.Status.writing {
-                        if (self.videoWriterInput?.isReadyForMoreMediaData == true) {
-                            print("Writting a sample");
-                            if  self.videoWriterInput?.append(cmSampleBuffer) == false {
-                                print(" we have a problem writing video")
-                                self.myResult!(false)
+                writingQueue.async {
+                    switch rpSampleType {
+                    case RPSampleBufferType.video:
+                        if !isWritingStarted {
+                            isWritingStarted = true
+                            if self.videoWriter?.status != .writing {
+                                self.videoWriter?.startWriting()
+                                self.videoWriter?.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(cmSampleBuffer))
+                                print("Started writing session")
+                                DispatchQueue.main.async {
+                                    self.myResult?(true)
+                                }
                             }
                         }
+                        
+                        if self.videoWriter?.status == .writing,
+                           let input = self.videoWriterInput,
+                           input.isReadyForMoreMediaData {
+                            if !input.append(cmSampleBuffer) {
+                                print("Failed to write video frame")
+                            }
+                        }
+                        
+                    case RPSampleBufferType.audioMic:
+                        if self.recordAudio,
+                           self.videoWriter?.status == .writing,
+                           self.audioInput.isReadyForMoreMediaData {
+                            if !self.audioInput.append(cmSampleBuffer) {
+                                print("Failed to write audio frame")
+                            }
+                        }
+                        
+                    @unknown default:
+                        break
                     }
-
-
-                default:
-                   print("not a video sample, so ignore");
                 }
-            } ){(error) in
-                        guard error == nil else {
-                           //Handle error
-                           print("Screen record not allowed");
-                           self.myResult!(false)
-                           return;
-                       }
-                   }
-        } else {
-            //Fallback on earlier versions
+            }) { [weak self] (error) in
+                if let error = error {
+                    print("Failed to start capture: \(error.localizedDescription)")
+                    self?.myResult?(false)
+                }
+            }
         }
     }
 
     @objc func stopRecording() {
-        //Stop Recording the screen
-        if #available(iOS 11.0, *) {
-            RPScreenRecorder.shared().stopCapture( handler: { (error) in
-                print("stopping recording");
-            })
-        } else {
-          //  Fallback on earlier versions
-        }
-
-        self.videoWriterInput?.markAsFinished();
-        self.audioInput?.markAsFinished();
+        print("Stopping recording...")
         
-        self.videoWriter?.finishWriting {
-            print("finished writing video");
-
-            //Now save the video
-            PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: self.videoOutputURL!)
-            }) { saved, error in
-                if saved {
-                    let alertController = UIAlertController(title: "Your video was successfully saved", message: nil, preferredStyle: .alert)
-                    let defaultAction = UIAlertAction(title: "OK", style: .default, handler: nil)
-                    alertController.addAction(defaultAction)
-                    //self.present(alertController, animated: true, completion: nil)
+        let group = DispatchGroup()
+        group.enter()
+        
+        if #available(iOS 11.0, *) {
+            RPScreenRecorder.shared().stopCapture { [weak self] (error) in
+                guard let self = self else {
+                    group.leave()
+                    return
                 }
-                if error != nil {
-                    print("Video did not save for some reason", error.debugDescription);
-                    debugPrint(error?.localizedDescription ?? "error is nil");
+                
+                if let error = error {
+                    print("Stop capture error: \(error.localizedDescription)")
+                    group.leave()
+                    return
+                }
+                
+                print("Capture stopped, finalizing video...")
+                
+                self.videoWriterInput?.markAsFinished()
+                if self.recordAudio {
+                    self.audioInput?.markAsFinished()
+                }
+                
+                self.videoWriter?.finishWriting { [weak self] in
+                    guard let self = self else {
+                        group.leave()
+                        return
+                    }
+                    
+                    if let error = self.videoWriter?.error {
+                        print("Error finishing video: \(error.localizedDescription)")
+                    } else {
+                        print("Video writing finished")
+                        
+                        // 直接保存到相册
+                        if let url = self.videoOutputURL {
+                            PHPhotoLibrary.shared().performChanges({
+                                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                            }) { success, error in
+                                if !success {
+                                    print("Error saving video: \(error?.localizedDescription ?? "")")
+                                }
+                            }
+                        }
+                    }
+                    group.leave()
                 }
             }
         }
-    
-}
+        
+        // 等待录制完成
+        _ = group.wait(timeout: .now() + 5.0)
+    }
     
 }
